@@ -68,21 +68,36 @@ docker-compose ps
 
 # 等待数据库就绪
 echo "⏳ 等待数据库就绪..."
+sleep 15
 until docker-compose exec mysql mysqladmin ping -h"localhost" --silent; do
     echo "等待MySQL启动..."
-    sleep 2
+    sleep 3
 done
+
+echo "✅ MySQL已启动，等待5秒确保完全就绪..."
+sleep 5
+
+# 检查数据库连接
+echo "🔗 测试数据库连接..."
+docker-compose exec mysql mysql -uroot -p123456 -e "SHOW DATABASES;" | grep archery || {
+    echo "❌ 数据库连接失败，请检查配置"
+    exit 1
+}
 
 # 初始化数据库
 echo "🗄️ 初始化数据库..."
-docker-compose exec archery bash -c "source /opt/venv4archery/bin/activate && python manage.py migrate"
+echo "  - 运行数据库迁移..."
+docker-compose exec archery bash -c "cd /opt/archery && source /opt/venv4archery/bin/activate && python manage.py migrate"
+
+echo "  - 收集静态文件..."
+docker-compose exec archery bash -c "cd /opt/archery && source /opt/venv4archery/bin/activate && python manage.py collectstatic --noinput"
 
 # 创建超级用户（可选）
 read -p "是否创建超级用户？(y/N): " -n 1 -r
 echo
 if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "👤 创建超级用户..."
-    docker-compose exec archery bash -c "source /opt/venv4archery/bin/activate && python manage.py createsuperuser"
+    docker-compose exec archery bash -c "cd /opt/archery && source /opt/venv4archery/bin/activate && python manage.py createsuperuser"
 fi
 
 # 显示访问信息
