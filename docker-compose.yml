@@ -1,0 +1,77 @@
+version: '3'
+
+services:
+  redis:
+    image: redis:5
+    container_name: archery-redis
+    restart: always
+    command: redis-server --requirepass 123456
+    expose:
+      - "6379"
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  mysql:
+    image: mysql:5.7
+    container_name: archery-mysql
+    restart: always
+    ports:
+      - "3306:3306"
+    volumes:
+      - "./data/mysql:/var/lib/mysql"
+      - "./config/mysql/my.cnf:/etc/mysql/my.cnf"
+    environment:
+      MYSQL_DATABASE: archery
+      MYSQL_ROOT_PASSWORD: 123456
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  goinception:
+    image: hanchuanchuan/goinception
+    container_name: archery-goinception
+    restart: always
+    ports:
+      - "4000:4000"
+    volumes:
+      - "./config/inception/config.toml:/etc/config.toml"
+
+  archery:
+    # 使用自定义构建的镜像，包含ODPS审核功能
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: archery-app
+    restart: always
+    depends_on:
+      redis:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    ports:
+      - "9123:9123"
+    volumes:
+      - "./config/archery/local_settings.py:/opt/archery/local_settings.py"
+      - "./config/archery/soar.yaml:/etc/soar.yaml"
+      - "./data/archery/downloads:/opt/archery/downloads"
+      - "./data/archery/logs:/opt/archery/logs"
+      - "./data/archery/keys:/opt/archery/keys"
+    environment:
+      - NGINX_PORT=9123
+      - DEBUG=false
+      - DATABASE_URL=mysql://root:123456@mysql:3306/archery
+      - CACHE_URL=redis://redis:6379/0?PASSWORD=123456
+      - CSRF_TRUSTED_ORIGINS=http://127.0.0.1:9123
+      - ENABLE_LDAP=false
+      - AUTH_LDAP_ALWAYS_UPDATE_USER=true
+      - AUTH_LDAP_USER_ATTR_MAP=username=cn,display=displayname,email=email
+      - Q_CLUISTER_WORKERS=4
+      - Q_CLUISTER_TIMEOUT=60
+      - Q_CLUISTER_SYNC=false
+      - CUSTOM_TITLE_SUFFIX=""
+    entrypoint: "bash /opt/archery/src/docker/startup.sh"
