@@ -2,10 +2,12 @@
 
 import re
 import logging
+import traceback
 import sqlparse
 
 from . import EngineBase
-from .models import ResultSet
+from .models import ResultSet, ReviewSet, ReviewResult
+from common.utils.timer import FuncTimer
 
 from odps import ODPS
 
@@ -156,3 +158,182 @@ class ODPSEngine(EngineBase):
         if result.get("bad_query"):
             result["msg"] = keyword_warning
         return result
+
+    def execute_check(self, db_name=None, sql=""):
+        """上线单执行前的检查, 返回Review set"""
+        check_result = ReviewSet(full_sql=sql)
+
+        # ODPS支持的SQL类型白名单
+        sql_whitelist = [
+            "select", "insert", "update", "delete", "create", "drop", "alter",
+            "truncate", "merge", "with", "desc", "describe", "show", "explain"
+        ]
+
+        # 删除注释语句，切分SQL
+        try:
+            sql_formatted = sqlparse.format(sql, strip_comments=True)
+            split_sql = sqlparse.split(sql_formatted)
+            split_sql = [stmt.strip() for stmt in split_sql if stmt.strip()]
+        except Exception as e:
+            check_result.error = f"SQL解析失败: {str(e)}"
+            return check_result
+
+        if not split_sql:
+            check_result.error = "没有有效的SQL语句"
+            return check_result
+
+        # 检查每条SQL语句
+        line = 1
+        for statement in split_sql:
+            statement = statement.rstrip(";")
+            if not statement:
+                continue
+
+            # 检查SQL类型是否在白名单中
+            sql_lower = statement.lower().strip()
+            is_valid = False
+            for allowed_type in sql_whitelist:
+                if sql_lower.startswith(allowed_type):
+                    is_valid = True
+                    break
+
+            if not is_valid:
+                result = ReviewResult(
+                    id=line,
+                    errlevel=2,
+                    stagestatus="Audit Failed",
+                    errormessage=f"不支持的SQL类型，仅支持: {', '.join(sql_whitelist)}",
+                    sql=statement,
+                    affected_rows=0,
+                    execute_time=0,
+                )
+                check_result.error_count += 1
+            else:
+                result = ReviewResult(
+                    id=line,
+                    errlevel=0,
+                    stagestatus="Audit completed",
+                    errormessage="通过审核",
+                    sql=statement,
+                    affected_rows=0,
+                    execute_time=0,
+                )
+
+            check_result.rows.append(result)
+            line += 1
+
+        return check_result
+
+    def execute(self, db_name=None, sql="", close_conn=True, **kwargs):
+        """执行SQL语句，返回ReviewSet"""
+        execute_result = ReviewSet(full_sql=sql)
+
+        try:
+            # 删除注释语句，切分SQL
+            sql_formatted = sqlparse.format(sql, strip_comments=True)
+            split_sql = sqlparse.split(sql_formatted)
+            split_sql = [stmt.strip() for stmt in split_sql if stmt.strip()]
+        except Exception as e:
+            execute_result.error = f"SQL解析失败: {str(e)}"
+            return execute_result
+
+        if not split_sql:
+            execute_result.error = "没有有效的SQL语句"
+            return execute_result
+
+        line = 1
+        conn = None
+
+        try:
+            conn = self.get_connection(db_name=db_name)
+
+            for statement in split_sql:
+                statement = statement.rstrip(";")
+                if not statement:
+                    continue
+
+                try:
+                    with FuncTimer() as t:
+                        # 执行SQL语句
+                        if statement.lower().strip().startswith('select'):
+                            # 对于查询语句，获取结果
+                            instance = conn.execute_sql(statement)
+                            reader = instance.open_reader()
+                            affected_rows = len([row for row in reader])
+                        else:
+                            # 对于非查询语句，直接执行
+                            instance = conn.execute_sql(statement)
+                            # ODPS的execute_sql返回的instance对象，需要等待执行完成
+                            instance.wait_for_completion()
+                            affected_rows = 0  # ODPS暂不支持获取影响行数
+
+                    execute_result.rows.append(
+                        ReviewResult(
+                            id=line,
+                            errlevel=0,
+                            stagestatus="Execute Successfully",
+                            errormessage="执行成功",
+                            sql=statement,
+                            affected_rows=affected_rows,
+                            execute_time=t.cost,
+                        )
+                    )
+
+                except Exception as e:
+                    logger.warning(
+                        f"ODPS语句执行报错，语句：{statement}，错误信息：{traceback.format_exc()}"
+                    )
+                    # 追加当前报错语句信息到执行结果中
+                    execute_result.error = str(e)
+                    execute_result.rows.append(
+                        ReviewResult(
+                            id=line,
+                            errlevel=2,
+                            stagestatus="Execute Failed",
+                            errormessage=f"执行失败：{str(e)}",
+                            sql=statement,
+                            affected_rows=0,
+                            execute_time=0,
+                        )
+                    )
+                    # 报错后停止执行后续语句
+                    line += 1
+                    # 将后续语句标记为未执行
+                    for remaining_statement in split_sql[line-1:]:
+                        if remaining_statement.strip():
+                            execute_result.rows.append(
+                                ReviewResult(
+                                    id=line,
+                                    errlevel=0,
+                                    stagestatus="Audit completed",
+                                    errormessage="前序语句失败，未执行",
+                                    sql=remaining_statement.rstrip(";"),
+                                    affected_rows=0,
+                                    execute_time=0,
+                                )
+                            )
+                            line += 1
+                    break
+
+                line += 1
+
+        except Exception as e:
+            logger.warning(f"ODPS连接或执行异常：{traceback.format_exc()}")
+            execute_result.error = str(e)
+
+        finally:
+            if close_conn and conn:
+                try:
+                    # ODPS连接通常不需要显式关闭，但可以清理连接对象
+                    self.conn = None
+                except Exception:
+                    pass
+
+        return execute_result
+
+    def execute_workflow(self, workflow):
+        """执行上线单，返回Review set"""
+        return self.execute(
+            db_name=workflow.db_name,
+            sql=workflow.sqlworkflowcontent.sql_content
+        )
